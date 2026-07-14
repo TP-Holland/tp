@@ -47,8 +47,8 @@ from ta.trend import SMAIndicator
 # CONFIGURATIE
 # ---------------------------------------------------------------------------
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "VUL_HIER_JE_TOKEN_IN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "VUL_HIER_JE_CHAT_ID_IN")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or "VUL_HIER_JE_TOKEN_IN"
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "VUL_HIER_JE_CHAT_ID_IN"
 
 INCLUDE_AEX = True
 INCLUDE_SP500 = True
@@ -141,6 +141,20 @@ def send_telegram_photo(image_bytes, caption):
 # ---------------------------------------------------------------------------
 # TELEGRAM: COMMANDO'S ONTVANGEN
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# STATE (welke signalen zijn al gemeld, voorkomt dubbele meldingen)
+# ---------------------------------------------------------------------------
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f)
 
 def load_offset():
     if os.path.exists(OFFSET_FILE):

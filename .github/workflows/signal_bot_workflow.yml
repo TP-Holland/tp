@@ -22,7 +22,7 @@ jobs:
           python-version: "3.11"
 
       - name: Installeer dependencies
-        run: pip install yfinance pandas matplotlib requests
+        run: pip install yfinance pandas matplotlib requests ta
 
       - name: Draai bot
         env:

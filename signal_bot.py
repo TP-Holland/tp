@@ -44,6 +44,7 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator
+from ta.volatility import BollingerBands
 
 # ---------------------------------------------------------------------------
 # CONFIGURATIE
@@ -51,6 +52,8 @@ from ta.trend import SMAIndicator
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN") or "VUL_HIER_JE_TOKEN_IN"
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "VUL_HIER_JE_CHAT_ID_IN"
+print(f"[DEBUG] TELEGRAM_TOKEN ingesteld: {'JA' if 'VUL_HIER' not in TELEGRAM_TOKEN else 'NEE (nog placeholder!)'} (lengte {len(TELEGRAM_TOKEN)})")
+print(f"[DEBUG] TELEGRAM_CHAT_ID ingesteld: {'JA' if 'VUL_HIER' not in TELEGRAM_CHAT_ID else 'NEE (nog placeholder!)'}")
 
 INCLUDE_AEX = True
 INCLUDE_SP500 = True
@@ -66,6 +69,9 @@ SETTINGS = {
     "rsi_oversold": 30,
     "sma_short": 20,
     "sma_long": 50,
+    "high_low_window": 10,   # ~2 handelsweken -- voor dag/week-trading, niet maanden/jaren
+    "bb_window": 20,
+    "bb_std": 2,
     "lookback_days": 120,
     "news_items_per_ticker": 2,
     "batch_size": 50,
@@ -455,6 +461,7 @@ def handle_investigate(name):
 def process_telegram_commands():
     offset = load_offset()
     updates = get_telegram_updates(offset)
+    print(f"[DEBUG] {len(updates)} Telegram-update(s) opgehaald (offset={offset}).")
     for update in updates:
         offset = update["update_id"] + 1
         message = update.get("message", {})
@@ -462,14 +469,17 @@ def process_telegram_commands():
         chat_id = message.get("chat", {}).get("id")
 
         if str(chat_id) != str(TELEGRAM_CHAT_ID):
+            print(f"[DEBUG] bericht genegeerd: chat_id={chat_id} komt niet overeen met TELEGRAM_CHAT_ID={TELEGRAM_CHAT_ID}")
             continue  # negeer berichten uit andere chats, voor de veiligheid
 
         if not text.startswith("/"):
+            print(f"[DEBUG] genegeerd (geen commando): '{text}'")
             continue
 
         parts = text.split(maxsplit=1)
         command = parts[0].lower()
         argument = parts[1].strip() if len(parts) > 1 else ""
+        print(f"[DEBUG] commando ontvangen: '{command}' argument='{argument}' van chat_id={chat_id}")
 
         if command == "/track":
             handle_track(argument)
@@ -588,6 +598,50 @@ def analyze_df(df, settings, pct_threshold):
             score += 15
             texts.append("'Death cross': de kortetermijntrend is net onder de langetermijntrend gezakt -- vaak gezien als teken dat de trend verzwakt.")
 
+    # --- Kortetermijn hoog/laag punt (gericht op dag/week-trading, niet maanden/jaren) ---
+    hl_window = settings["high_low_window"]
+    if len(close) >= hl_window:
+        recent = close.iloc[-hl_window:]
+        recent_high = float(recent.max())
+        recent_low = float(recent.min())
+        span = recent_high - recent_low
+        if span > 0:
+            dist_to_high_pct = (recent_high - last_price) / span * 100
+            dist_to_low_pct = (last_price - recent_low) / span * 100
+            if dist_to_high_pct <= 5:
+                score += 12
+                texts.append(f"🔴 MOGELIJK VERKOOPMOMENT (cijfermatig signaal): koers ({last_price:.2f}) staat op/bij het "
+                              f"hoogste punt van de laatste {hl_window} handelsdagen ({recent_high:.2f}). "
+                              f"Statistisch gezien is dit het punt waarop kortetermijn-traders vaak winst nemen, "
+                              f"omdat de koers hierna geregeld weer terugzakt. Kan ook doorzetten bij aanhoudend momentum -- "
+                              f"geen garantie, puur een patroon uit de cijfers.")
+            elif dist_to_low_pct <= 5:
+                score += 12
+                texts.append(f"🟢 MOGELIJK KOOPMOMENT (cijfermatig signaal): koers ({last_price:.2f}) staat op/bij het "
+                              f"laagste punt van de laatste {hl_window} handelsdagen ({recent_low:.2f}). "
+                              f"Statistisch gezien is dit het punt waarop kortetermijn-traders vaak instappen, "
+                              f"omdat de koers hierna geregeld weer opveert. Kan ook wijzen op aanhoudende verkoopdruk -- "
+                              f"geen garantie, puur een patroon uit de cijfers.")
+
+    # --- Bollinger Bands: staat de koers kortetermijn "te ver" van zijn gemiddelde? ---
+    if len(close) >= settings["bb_window"]:
+        bb = BollingerBands(close, window=settings["bb_window"], window_dev=settings["bb_std"])
+        upper = bb.bollinger_hband()
+        lower = bb.bollinger_lband()
+        if not upper.dropna().empty and not lower.dropna().empty:
+            last_upper = float(upper.iloc[-1])
+            last_lower = float(lower.iloc[-1])
+            if last_price >= last_upper:
+                score += 10
+                texts.append(f"🔴 MOGELIJK VERKOOPMOMENT (cijfermatig signaal): koers ({last_price:.2f}) zit op/boven de "
+                              f"bovenste Bollinger-band ({last_upper:.2f}). Statistisch gezien is de koers hiermee "
+                              f"kortetermijn 'te duur' t.o.v. zijn eigen recente gemiddelde -- vaak volgt hierna een korte terugval.")
+            elif last_price <= last_lower:
+                score += 10
+                texts.append(f"🟢 MOGELIJK KOOPMOMENT (cijfermatig signaal): koers ({last_price:.2f}) zit op/onder de "
+                              f"onderste Bollinger-band ({last_lower:.2f}). Statistisch gezien is de koers hiermee "
+                              f"kortetermijn 'te goedkoop' t.o.v. zijn eigen recente gemiddelde -- vaak volgt hierna een korte opleving.")
+
     return score, texts, last_price
 
 def make_chart(ticker, df, settings):
@@ -635,7 +689,8 @@ def build_and_send_alert(ticker, display_name, texts, price, df, state, state_ke
             caption_lines.append(f"- {title}" + (f"\n  {link}" if link else ""))
 
     caption_lines.append("")
-    caption_lines.append("👉 Geen koop/verkoopsignaal -- alleen een indicatie. Zoek zelf de reden op.")
+    caption_lines.append("👉 Dit zijn cijfermatige patronen (wat de statistiek/indicatoren zeggen), "
+                          "geen persoonlijk koop-/verkoopadvies. De koers kan altijd tegen het patroon in bewegen.")
     caption = "\n".join(caption_lines)
 
     try:

@@ -1,0 +1,39 @@
+name: Signal Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # elke 5 minuten (GitHub's praktische minimum; kan bij drukte iets vertragen)
+  workflow_dispatch:        # + handmatig via "Run workflow" in de Actions-tab
+
+permissions:
+  contents: write            # nodig om state-bestanden terug te committen
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: signal-bot      # voorkomt dat twee runs tegelijk draaien en elkaars state overschrijven
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installeer dependencies
+        run: pip install yfinance pandas matplotlib requests
+
+      - name: Draai bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python signal_bot.py
+
+      - name: Bewaar state voor volgende run
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add tracked_tickers.json telegram_offset.json last_auto_run.json last_tracked_run.json signal_bot_state.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update bot state [skip ci]"
+          git push

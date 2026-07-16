@@ -1,0 +1,13 @@
+name: Test Schedule
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Zeg hallo met tijdstip
+        run: echo "Scheduled run op $(date -u)"

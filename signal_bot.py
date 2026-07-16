@@ -240,12 +240,22 @@ def handle_track(name):
     if any(t["ticker"] == ticker for t in tracked):
         send_telegram_text(f"'{resolved_name}' ({ticker}) wordt al gevolgd.")
         return
-    tracked.append({"ticker": ticker, "name": resolved_name})
+
+    entry_price = get_current_price(ticker)
+    tracked.append({
+        "ticker": ticker,
+        "name": resolved_name,
+        "entry_price": entry_price,
+        "entry_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    })
     save_tracked(tracked)
+
+    prijs_tekst = f" tegen een koers van {entry_price:.2f}." if entry_price is not None else " (koers kon niet direct opgehaald worden)."
     send_telegram_text(
-        f"✅ '{resolved_name}' ({ticker}) wordt nu gevolgd.\n"
+        f"✅ '{resolved_name}' ({ticker}) wordt nu gevolgd{prijs_tekst}\n"
         f"Je krijgt een melding bij koersschommelingen >{SETTINGS['safety_pct_threshold']}% (in een dag) "
-        f"of technische signalen.\nDit wordt elke {TRACKED_CHECK_INTERVAL_MINUTES} minuten gecheckt."
+        f"of technische signalen -- steeds met je eigen winst/verlies sinds tracking erbij.\n"
+        f"Dit wordt elke {TRACKED_CHECK_INTERVAL_MINUTES} minuten gecheckt."
     )
 
 def handle_untrack(name):
@@ -273,7 +283,18 @@ def handle_list():
         return
     lines = ["Je volgt momenteel:"]
     for t in tracked:
-        lines.append(f"- {t['name']} ({t['ticker']})")
+        entry_price = t.get("entry_price")
+        entry_date = t.get("entry_date")
+        line = f"- {t['name']} ({t['ticker']})"
+        if entry_price is not None:
+            current_price = get_current_price(t["ticker"])
+            if current_price is not None:
+                pct = (current_price - entry_price) / entry_price * 100
+                teken = "+" if pct >= 0 else ""
+                line += f": instap {entry_price:.2f} ({entry_date}) -> nu {current_price:.2f} ({teken}{pct:.1f}%)"
+            else:
+                line += f": instap {entry_price:.2f} ({entry_date})"
+        lines.append(line)
     send_telegram_text("\n".join(lines))
 
 def handle_help():
@@ -546,6 +567,21 @@ def download_single(ticker, period):
         print(f"[FOUT] download {ticker} mislukt: {e}")
         return None
 
+def get_current_price(ticker):
+    """Snelle huidige-koers-lookup, gebruikt om de instapprijs bij /track vast te leggen."""
+    try:
+        df = download_single(ticker, "5d")
+        if df is None or df.empty:
+            return None
+        close = df["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        return float(close.iloc[-1]) if len(close) else None
+    except Exception as e:
+        print(f"[FOUT] huidige koers ophalen mislukt voor {ticker}: {e}")
+        return None
+
 # ---------------------------------------------------------------------------
 # ANALYSE
 # ---------------------------------------------------------------------------
@@ -719,17 +755,26 @@ def check_tracked_tickers(on_demand=False):
     found_any = False
     for entry in tracked:
         ticker, name = entry["ticker"], entry["name"]
+        entry_price = entry.get("entry_price")
+        entry_date = entry.get("entry_date")
         df = download_single(ticker, f"{SETTINGS['lookback_days']}d")
         if df is None:
             continue
         score, texts, price = analyze_df(df, SETTINGS, SETTINGS["safety_pct_threshold"])
+
+        gain_line = ""
+        if entry_price is not None and price is not None:
+            pct = (price - entry_price) / entry_price * 100
+            teken = "+" if pct >= 0 else ""
+            gain_line = f" | Jouw instap: {entry_price:.2f} op {entry_date} -> nu {teken}{pct:.1f}%"
+
         if texts:
-            header = f"🔔 Gevolgd aandeel -- {name}"
+            header = f"🔔 Gevolgd aandeel -- {name}{gain_line}"
             texts_with_prefix = [f"[Veiligheidsmelding] {t}" for t in texts]
             sent = build_and_send_alert(ticker, header, texts_with_prefix, price, df, state, "tracked")
             found_any = found_any or sent
         elif on_demand and price is not None:
-            send_telegram_text(f"ℹ️ {name} ({ticker}): koers {price:.2f}, geen bijzondere signalen op dit moment.")
+            send_telegram_text(f"ℹ️ {name} ({ticker}): koers {price:.2f}{gain_line}, geen bijzondere signalen op dit moment.")
             found_any = True
     if on_demand and not found_any:
         send_telegram_text("Geen bijzonderheden bij je gevolgde aandelen op dit moment.")

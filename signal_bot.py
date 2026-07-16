@@ -13,6 +13,8 @@ Telegram commando's (stuur ze gewoon in je Telegram-chat met de bot):
     /untrack nvidia -> stopt met volgen
     /list           -> toont wat je nu volgt
     /data           -> vraag nu meteen een verse check op (geen wachten op schema)
+    /investigate nvidia -> cijfermatig onderzoeksrapport over een bedrijf
+                           (omzet, winst, marge, waardering, schuld, lange termijn)
     /help           -> toont deze commando's
 
 Draaien:
@@ -53,7 +55,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or "VUL_HIER_JE_CHAT_ID_IN
 INCLUDE_AEX = True
 INCLUDE_SP500 = True
 TOP_N = 5
-AUTO_CHECK_INTERVAL_HOURS = 6  # hoe vaak automatisch gecheckt wordt (naast /data op aanvraag)
+AUTO_CHECK_INTERVAL_HOURS = 6      # hoe vaak de ZWARE AEX/S&P-scan draait
+TRACKED_CHECK_INTERVAL_MINUTES = 5  # hoe vaak JOUW gevolgde aandelen gecheckt worden (lichter, dus mag vaker)
 
 SETTINGS = {
     "pct_change_threshold": 5.0,      # drempel voor de grote AEX/S&P-scan
@@ -71,7 +74,8 @@ SETTINGS = {
 STATE_FILE = "signal_bot_state.json"
 TRACKED_FILE = "tracked_tickers.json"
 OFFSET_FILE = "telegram_offset.json"
-LAST_AUTO_FILE = "last_auto_run.json"
+LAST_AUTO_FILE = "last_auto_run.json"          # laatste zware AEX/S&P-scan
+LAST_TRACKED_FILE = "last_tracked_run.json"    # laatste check van jouw /track-lijst
 
 def should_run_auto():
     if not os.path.exists(LAST_AUTO_FILE):
@@ -83,6 +87,17 @@ def should_run_auto():
 def mark_auto_done():
     with open(LAST_AUTO_FILE, "w") as f:
         json.dump({"last_auto": time.time()}, f)
+
+def should_run_tracked():
+    if not os.path.exists(LAST_TRACKED_FILE):
+        return True
+    with open(LAST_TRACKED_FILE) as f:
+        last = json.load(f).get("last_tracked", 0)
+    return (time.time() - last) >= TRACKED_CHECK_INTERVAL_MINUTES * 60
+
+def mark_tracked_done():
+    with open(LAST_TRACKED_FILE, "w") as f:
+        json.dump({"last_tracked": time.time()}, f)
 
 AEX_TICKERS = [
     "ASML.AS", "SHELL.AS", "UNA.AS", "INGA.AS", "ADYEN.AS", "PRX.AS", "AD.AS",
@@ -221,7 +236,11 @@ def handle_track(name):
         return
     tracked.append({"ticker": ticker, "name": resolved_name})
     save_tracked(tracked)
-    send_telegram_text(f"✅ '{resolved_name}' ({ticker}) wordt nu gevolgd.\nJe krijgt een melding bij verdachte koersschommelingen (>{SETTINGS['safety_pct_threshold']}% in een dag) of technische signalen.")
+    send_telegram_text(
+        f"✅ '{resolved_name}' ({ticker}) wordt nu gevolgd.\n"
+        f"Je krijgt een melding bij koersschommelingen >{SETTINGS['safety_pct_threshold']}% (in een dag) "
+        f"of technische signalen.\nDit wordt elke {TRACKED_CHECK_INTERVAL_MINUTES} minuten gecheckt."
+    )
 
 def handle_untrack(name):
     if not name:
@@ -258,6 +277,8 @@ def handle_help():
         "/untrack <naam> -- stop met volgen\n"
         "/list -- toon wat je nu volgt\n"
         "/data -- vraag nu meteen een verse check op (gevolgde aandelen + marktscan)\n"
+        "/investigate <naam> -- cijfermatig onderzoeksrapport (omzet, winst, marge,\n"
+        "    waardering, schuld, lange termijn) -- bv: /investigate asml\n"
         "/help -- toon dit bericht\n\n"
         f"Automatisch wordt er ook elke {AUTO_CHECK_INTERVAL_HOURS} uur gecheckt, "
         "dus /data is alleen nodig als je tussendoor iets wil weten."
@@ -267,6 +288,169 @@ def handle_data():
     send_telegram_text("🔎 Even data ophalen, momentje...")
     check_tracked_tickers(on_demand=True)
     run_scan(on_demand=True)
+
+# ---------------------------------------------------------------------------
+# ONDERZOEK (/investigate) -- puur cijfermatig bedrijfsrapport, geen AI-oordeel
+# ---------------------------------------------------------------------------
+
+def get_fundamentals(ticker):
+    try:
+        return yf.Ticker(ticker).info
+    except Exception as e:
+        print(f"[FOUT] fundamentals ophalen mislukt voor {ticker}: {e}")
+        return None
+
+def handle_investigate(name):
+    if not name:
+        send_telegram_text("Gebruik: /investigate <naam>, bijvoorbeeld: /investigate asml")
+        return
+    ticker, resolved_name = resolve_ticker(name)
+    if not ticker:
+        send_telegram_text(f"Kon geen aandeel vinden voor '{name}'. Probeer de volledige naam of het tickersymbool.")
+        return
+
+    send_telegram_text(f"🔬 Bezig met onderzoeken van {resolved_name} ({ticker}), momentje...")
+
+    info = get_fundamentals(ticker)
+    if not info:
+        send_telegram_text(f"Kon geen bedrijfsdata ophalen voor {resolved_name} ({ticker}).")
+        return
+
+    lines = [f"🔬 Onderzoek: {resolved_name} ({ticker})", ""]
+
+    sector = info.get("sector")
+    industry = info.get("industry")
+    if sector:
+        lines.append(f"Sector: {sector}" + (f" / {industry}" if industry else ""))
+
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    market_cap = info.get("marketCap")
+    currency = info.get("currency", "")
+    if price:
+        lines.append(f"Huidige koers: {price:.2f} {currency}")
+    if market_cap:
+        lines.append(f"Marktkapitalisatie: {market_cap / 1e9:.1f} miljard {currency}")
+
+    revenue = info.get("totalRevenue")
+    revenue_growth = info.get("revenueGrowth")
+    profit_margin = info.get("profitMargins")
+    net_income = info.get("netIncomeToCommon")
+
+    lines.append("")
+    lines.append("Omzet & winst:")
+    if revenue:
+        lines.append(f"- Omzet (laatste 12 mnd): {revenue / 1e9:.2f} miljard")
+    if revenue_growth is not None:
+        lines.append(f"- Omzetgroei (jaar-op-jaar): {revenue_growth * 100:.1f}%")
+    if net_income is not None:
+        lines.append(f"- Nettowinst: {net_income / 1e9:.2f} miljard" if net_income >= 0
+                      else f"- Nettoverlies: {abs(net_income) / 1e9:.2f} miljard")
+    if profit_margin is not None:
+        lines.append(f"- Winstmarge: {profit_margin * 100:.1f}%")
+    if revenue is None and net_income is None:
+        lines.append("- Geen omzet/winstcijfers beschikbaar")
+
+    trailing_pe = info.get("trailingPE")
+    forward_pe = info.get("forwardPE")
+    peg = info.get("pegRatio")
+
+    lines.append("")
+    lines.append("Waardering:")
+    if trailing_pe:
+        lines.append(f"- K/W-ratio (trailing): {trailing_pe:.1f}")
+    if forward_pe:
+        lines.append(f"- K/W-ratio (forward): {forward_pe:.1f}")
+    if peg:
+        lines.append(f"- PEG-ratio: {peg:.2f}")
+    if not trailing_pe and not forward_pe:
+        lines.append("- Geen waarderingscijfers beschikbaar (bv. bedrijf maakt geen winst)")
+
+    debt_to_equity = info.get("debtToEquity")
+    total_debt = info.get("totalDebt")
+    total_cash = info.get("totalCash")
+
+    lines.append("")
+    lines.append("Schuldpositie:")
+    if debt_to_equity is not None:
+        lines.append(f"- Schuld/eigen vermogen: {debt_to_equity:.0f}%")
+    if total_debt:
+        lines.append(f"- Totale schuld: {total_debt / 1e9:.2f} miljard")
+    if total_cash:
+        lines.append(f"- Kaspositie: {total_cash / 1e9:.2f} miljard")
+
+    dividend_yield = info.get("dividendYield")
+    lines.append("")
+    lines.append("Dividend:")
+    lines.append(f"- Dividendrendement: {dividend_yield * 100:.2f}%" if dividend_yield
+                  else "- Geen dividend uitgekeerd")
+
+    hist = download_single(ticker, "5y")
+    perf_texts = []
+    if hist is not None and not hist.empty:
+        close = hist["Close"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        close = close.dropna()
+        if len(close) > 0:
+            current = float(close.iloc[-1])
+            for label, days in [("1 jaar", 252), ("3 jaar", 756), ("5 jaar", 1260)]:
+                if len(close) > days:
+                    past = float(close.iloc[-days])
+                    change = (current - past) / past * 100
+                    perf_texts.append(f"- Koers vs {label} geleden: {change:+.1f}%")
+
+    lines.append("")
+    lines.append("Lange termijn koersontwikkeling:")
+    lines.extend(perf_texts if perf_texts else ["- Onvoldoende historische data beschikbaar"])
+
+    # Puur cijfermatig afgeleide sterke punten -- geen mening, alleen drempelwaarden op de data hierboven
+    plus = []
+    if revenue_growth is not None and revenue_growth > 0.10:
+        plus.append(f"Omzet groeit stevig ({revenue_growth * 100:.1f}% jaar-op-jaar)")
+    if profit_margin is not None and profit_margin > 0.15:
+        plus.append(f"Gezonde winstmarge ({profit_margin * 100:.1f}%)")
+    if debt_to_equity is not None and debt_to_equity < 50:
+        plus.append("Relatief lage schuldpositie t.o.v. eigen vermogen")
+    if perf_texts and all(t.split(": ")[-1].startswith("+") for t in perf_texts):
+        plus.append("Koers is over alle bekeken periodes gestegen")
+    if dividend_yield:
+        plus.append(f"Keert dividend uit ({dividend_yield * 100:.2f}%)")
+
+    lines.append("")
+    lines.append("Sterke punten (cijfermatig):")
+    lines.extend([f"- {p}" for p in plus] if plus else ["- Geen duidelijke pluspunten op deze criteria"])
+
+    # Puur cijfermatig afgeleide aandachtspunten
+    minus = []
+    if revenue_growth is not None and revenue_growth < 0:
+        minus.append(f"Omzet krimpt ({revenue_growth * 100:.1f}% jaar-op-jaar)")
+    if net_income is not None and net_income < 0:
+        minus.append("Bedrijf maakt momenteel verlies")
+    elif profit_margin is not None and profit_margin < 0.05:
+        minus.append(f"Lage winstmarge ({profit_margin * 100:.1f}%)")
+    if debt_to_equity is not None and debt_to_equity > 150:
+        minus.append("Hoge schuldpositie t.o.v. eigen vermogen")
+    if trailing_pe is not None and trailing_pe > 40:
+        minus.append(f"Hoge waardering (K/W {trailing_pe:.0f}) -- veel toekomstige groei is al ingeprijsd")
+
+    lines.append("")
+    lines.append("Aandachtspunten (cijfermatig):")
+    lines.extend([f"- {m}" for m in minus] if minus else ["- Geen duidelijke knelpunten op deze criteria"])
+
+    lines.append("")
+    lines.append("👉 Dit is een puur cijfermatige analyse, geen koop/verkoopadvies. "
+                  "De cijfers zeggen niets over toekomstige koersontwikkeling -- doe altijd zelf verder onderzoek.")
+
+    caption = "\n".join(lines)
+
+    try:
+        if hist is not None and not hist.empty:
+            chart_buf = make_chart(ticker, hist, SETTINGS)
+            send_telegram_photo(chart_buf, f"{resolved_name} ({ticker}) -- koers laatste 5 jaar")
+        send_telegram_text(caption)
+    except Exception as e:
+        print(f"[FOUT] investigate-rapport versturen mislukt voor {ticker}: {e}")
+        send_telegram_text(caption)
 
 def process_telegram_commands():
     offset = load_offset()
@@ -295,6 +479,8 @@ def process_telegram_commands():
             handle_list()
         elif command == "/data":
             handle_data()
+        elif command == "/investigate":
+            handle_investigate(argument)
         elif command in ("/help", "/start"):
             handle_help()
 
@@ -547,13 +733,18 @@ if __name__ == "__main__":
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--command-interval", type=int, default=30,
                          help="Seconden tussen het pollen op nieuwe Telegram-commando's (default 30s, dit is gratis/lichtgewicht)")
+    parser.add_argument("--tracked-interval", type=int, default=TRACKED_CHECK_INTERVAL_MINUTES * 60,
+                         help=f"Seconden tussen checks van je /track-lijst (default {TRACKED_CHECK_INTERVAL_MINUTES} min)")
     parser.add_argument("--auto-interval", type=int, default=AUTO_CHECK_INTERVAL_HOURS * 3600,
-                         help=f"Seconden tussen automatische checks (default {AUTO_CHECK_INTERVAL_HOURS} uur)")
+                         help=f"Seconden tussen de zware AEX/S&P-scan (default {AUTO_CHECK_INTERVAL_HOURS} uur)")
     args = parser.parse_args()
 
     if args.loop:
-        print(f"Bot draait continu. Commando's elke {args.command_interval}s, automatische check elke {args.auto_interval/3600:.1f}u. Ctrl+C om te stoppen.")
-        last_auto = 0
+        print(f"Bot draait continu. Commando's elke {args.command_interval}s, "
+              f"tracked-check elke {args.tracked_interval/60:.0f} min, "
+              f"scan elke {args.auto_interval/3600:.1f}u. Ctrl+C om te stoppen.")
+        last_tracked = 0
+        last_scan = 0
         while True:
             try:
                 process_telegram_commands()
@@ -561,23 +752,36 @@ if __name__ == "__main__":
                 print(f"[FOUT] commando-verwerking: {e}")
 
             now = time.time()
-            if now - last_auto >= args.auto_interval:
+            if now - last_tracked >= args.tracked_interval:
                 try:
                     check_tracked_tickers()
                 except Exception as e:
                     print(f"[FOUT] tracked-check: {e}")
+                last_tracked = now
+
+            if now - last_scan >= args.auto_interval:
                 try:
                     run_scan()
                 except Exception as e:
                     print(f"[FOUT] scan: {e}")
-                last_auto = now
+                last_scan = now
 
             time.sleep(args.command_interval)
     else:
+        # Eenmalige run (bv. aangeroepen door een GitHub Actions cron-schema).
+        # Elk van de twee checks houdt zijn EIGEN laatst-gedraaid-tijdstip bij
+        # in een los bestand, zodat ze onafhankelijk van elkaar op hun eigen
+        # interval draaien -- ongeacht hoe vaak deze workflow zelf getriggerd wordt.
         process_telegram_commands()
-        if should_run_auto():
+
+        if should_run_tracked():
             check_tracked_tickers()
+            mark_tracked_done()
+        else:
+            print("Tracked-check nog niet aan de beurt (TRACKED_CHECK_INTERVAL_MINUTES nog niet verstreken).")
+
+        if should_run_auto():
             run_scan()
             mark_auto_done()
         else:
-            print("Automatische check nog niet aan de beurt (AUTO_CHECK_INTERVAL_HOURS nog niet verstreken).")
+            print("Marktscan nog niet aan de beurt (AUTO_CHECK_INTERVAL_HOURS nog niet verstreken).")
